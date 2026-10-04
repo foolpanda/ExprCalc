@@ -11,6 +11,7 @@
 //    ✅ 左侧 30% 变量面板（增/删/改）
 //    ✅ 右侧 70% 表达式输入 → 计算按钮 → 结果 → 函数参考
 //    ✅ Return / ⌘Return / 按钮 三种方式触发计算
+//    ✅ 鼠标可完成全部输入：数字/括号/退格按键行 + 运算符/函数/变量点击插入光标处
 //    ✅ 运算符：+ - * / ^ ( )  ，幂右结合，一元负号低于幂
 //    ✅ 函数：sin cos tan deg rad ln log exp pow sqrt abs ceil floor round
 //    ✅ 常量：pi, e
@@ -284,19 +285,161 @@ final class ExprEvaluator {
     }
 }
 
-
-// MARK: - ════════════════════════════════════════════════════════════════════
+// MARK: - ══════════════════════════════════════════════════════════════════════
 //  第二部分：SwiftUI 界面
 //  ═══════════════════════════════════════════════════════════════════════════
 
-struct Variable: Identifiable, Equatable {
-    let id = UUID()
-    var name: String
-    var value: Double
+import AppKit
+
+// MARK: - 表达式编辑控制器（供按键插入，光标感知）
+
+final class ExpressionEditorController {
+    fileprivate weak var textView: NSTextView?
+    fileprivate var selectedRange = NSRange(location: 0, length: 0)
+
+    /// 在当前光标/选区处插入文本
+    /// - caretOffset: 插入后光标相对插入起点的偏移（nil 表示落在插入文本末尾）
+    /// - selectLength: 大于 0 时在光标处选中占位符（如 sin(x) 中的 x，可直接输入覆盖）
+    func insert(_ snippet: String, caretOffset: Int? = nil, selectLength: Int = 0) {
+        guard let tv = textView else { return }
+        let sel = normalizedSelection(of: tv)
+        let offset = min(caretOffset ?? (snippet as NSString).length, (snippet as NSString).length)
+        let newSelection = NSRange(location: sel.location + offset, length: selectLength)
+        performEdit(on: tv, range: sel, replacement: snippet, newSelection: newSelection)
+    }
+
+    /// 退格：有选区先删选区，否则删除光标前一个字符
+    func backspace() {
+        guard let tv = textView else { return }
+        let sel = normalizedSelection(of: tv)
+        if sel.length > 0 {
+            performEdit(on: tv, range: sel, replacement: "",
+                        newSelection: NSRange(location: sel.location, length: 0))
+        } else if sel.location > 0 {
+            let previous = NSRange(location: sel.location - 1, length: 1)
+            performEdit(on: tv, range: previous, replacement: "",
+                        newSelection: NSRange(location: previous.location, length: 0))
+        }
+    }
+
+    private func normalizedSelection(of tv: NSTextView) -> NSRange {
+        let length = (tv.string as NSString).length
+        let sel = tv.selectedRange()
+        if sel.location == NSNotFound || sel.location > length {
+            return NSRange(location: length, length: 0)
+        }
+        return sel
+    }
+
+    /// 支持 undo 的程序化编辑；编辑后把键盘焦点交还给文本框
+    private func performEdit(on tv: NSTextView, range: NSRange, replacement: String, newSelection: NSRange) {
+        tv.shouldChangeText(in: range, replacementString: replacement)
+        tv.textStorage?.replaceCharacters(in: range, with: replacement)
+        tv.didChangeText()
+        tv.setSelectedRange(newSelection)
+        tv.scrollRangeToVisible(newSelection)
+        if tv.window?.firstResponder !== tv {
+            tv.window?.makeFirstResponder(tv)
+        }
+    }
 }
+
+// MARK: - 表达式编辑器（NSTextView 封装，向控制器同步光标）
+
+struct ExpressionEditor: NSViewRepresentable {
+    @Binding var text: String
+    let controller: ExpressionEditorController
+    var onReturn: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(self)
+    }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSScrollView()
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.borderType = .noBorder
+        scrollView.drawsBackground = false
+        scrollView.focusRingType = .none
+
+        let tv = NSTextView()
+        tv.isRichText = false
+        tv.allowsUndo = true
+        tv.usesFontPanel = false
+        tv.smartInsertDeleteEnabled = false
+        tv.isAutomaticQuoteSubstitutionEnabled = false
+        tv.isAutomaticDashSubstitutionEnabled = false
+        tv.isAutomaticTextReplacementEnabled = false
+        tv.isAutomaticSpellingCorrectionEnabled = false
+        tv.isContinuousSpellCheckingEnabled = false
+        tv.font = NSFont.monospacedSystemFont(ofSize: 21, weight: .regular)
+        tv.textColor = .labelColor
+        tv.drawsBackground = false
+        tv.isVerticallyResizable = true
+        tv.isHorizontallyResizable = false
+        tv.autoresizingMask = [.width]
+        tv.textContainer?.widthTracksTextView = true
+        tv.textContainer?.containerSize = NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
+        tv.textContainerInset = NSSize(width: 2, height: 8)
+        tv.string = text
+        tv.delegate = context.coordinator
+
+        scrollView.documentView = tv
+
+        controller.textView = tv
+        DispatchQueue.main.async {
+            tv.window?.makeFirstResponder(tv)
+            // 初始光标落在表达式末尾，点击按键即追加油
+            let end = NSRange(location: (tv.string as NSString).length, length: 0)
+            tv.setSelectedRange(end)
+        }
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        guard let tv = scrollView.documentView as? NSTextView else { return }
+        controller.textView = tv
+        if tv.string != text {
+            tv.string = text
+            let length = (text as NSString).length
+            let location = min(controller.selectedRange.location, length)
+            tv.setSelectedRange(NSRange(location: location, length: 0))
+        }
+    }
+
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        var parent: ExpressionEditor
+        init(_ parent: ExpressionEditor) { self.parent = parent }
+
+        func textDidChange(_ notification: Notification) {
+            guard let tv = notification.object as? NSTextView else { return }
+            parent.text = tv.string
+            parent.controller.selectedRange = tv.selectedRange()
+        }
+
+        func textViewDidChangeSelection(_ notification: Notification) {
+            guard let tv = notification.object as? NSTextView else { return }
+            parent.controller.selectedRange = tv.selectedRange()
+        }
+
+        // Return 触发计算，不插入换行
+        func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+                parent.onReturn()
+                return true
+            }
+            return false
+        }
+    }
+}
+
+// MARK: - 视图模型
 
 @MainActor
 final class CalcViewModel: ObservableObject {
+
+    let editor = ExpressionEditorController()
 
     @Published var variables: [Variable] = [
         Variable(name: "x", value: 3),
@@ -353,6 +496,15 @@ final class CalcViewModel: ObservableObject {
         }
     }
 
+    /// 按键/参考项/变量插入到光标处
+    func insert(_ snippet: String, caretOffset: Int? = nil, selectLength: Int = 0) {
+        editor.insert(snippet, caretOffset: caretOffset, selectLength: selectLength)
+    }
+
+    func backspace() {
+        editor.backspace()
+    }
+
     func addVariable() {
         let base = "v"
         var n = 1
@@ -380,6 +532,8 @@ final class CalcViewModel: ObservableObject {
         }
     }
 }
+
+// MARK: - 主视图
 
 struct ContentView: View {
     @StateObject private var vm = CalcViewModel()
@@ -447,13 +601,14 @@ struct ContentView: View {
             Divider().padding(.horizontal, 12)
 
             VStack(alignment: .leading, spacing: 4) {
-                Text("当前变量值").font(.caption.bold()).foregroundStyle(.secondary)
+                Text("当前变量值（点击插入）").font(.caption.bold()).foregroundStyle(.secondary)
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 2) {
                         ForEach(vm.variables) { v in
                             if !v.name.isEmpty {
-                                Text("\(v.name) = \(format(v.value))")
-                                    .font(.caption.monospaced())
+                                VariableChip(name: v.name, value: format(v.value)) {
+                                    vm.insert(v.name)
+                                }
                             }
                         }
                     }
@@ -466,25 +621,25 @@ struct ContentView: View {
         .frame(minWidth: 240)
     }
 
-    // MARK: 右面板：输入 + 按钮 + 结果 + 参考（70%）
+    // MARK: 右面板：输入 + 按键行 + 按钮 + 结果 + 参考（70%）
     private var expressionPanel: some View {
         VStack(alignment: .leading, spacing: 14) {
-            // ① 输入框
+            // ① 输入框 + 按键行
             VStack(alignment: .leading, spacing: 6) {
                 Text("数学表达式").font(.headline)
-                TextEditor(text: $vm.expression)
-                    .font(.title2.monospaced())
-                    .padding(8)
+                ExpressionEditor(text: $vm.expression, controller: vm.editor, onReturn: { vm.compute() })
                     .frame(minHeight: 60, maxHeight: 110)
                     .overlay(
                         RoundedRectangle(cornerRadius: 8)
                             .stroke(.quaternary, lineWidth: 1)
                     )
-                    .onKeyPress(.return) {
-                        vm.compute()
-                        return .handled
-                    }
-                Text("按 Return 或 ⌘Return 立即计算").font(.caption).foregroundStyle(.tertiary)
+
+                // 输入框下方第一行：数字 / 小数点 / 括号 / 退格
+                keypadRow
+
+                Text("按 Return 或 ⌘Return 立即计算；按键与参考项插入到光标处")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
             }
             .padding(.horizontal, 16)
             .padding(.top, 12)
@@ -534,9 +689,9 @@ struct ContentView: View {
 
             Divider()
 
-            // ④ 支持的运算与函数参考（双列展示，常规窗口下无需滚动）
+            // ④ 支持的运算与函数参考（双列展示，点击插入）
             VStack(alignment: .leading, spacing: 8) {
-                Text("支持的运算与函数").font(.headline)
+                Text("支持的运算与函数（点击插入）").font(.headline)
                 ScrollView {
                     HStack(alignment: .top, spacing: 28) {
                         VStack(alignment: .leading, spacing: 10) {
@@ -556,62 +711,95 @@ struct ContentView: View {
         }
     }
 
+    // MARK: 数字/括号/退格按键行
+
+    private var keypadRow: some View {
+        HStack(spacing: 5) {
+            ForEach(0..<10, id: \.self) { digit in
+                keyButton("\(digit)", tip: "插入 \(digit)") { vm.insert("\(digit)") }
+            }
+            keyButton(".", tip: "插入小数点") { vm.insert(".") }
+            keyButton("(", tip: "插入左括号") { vm.insert("(", caretOffset: 1) }
+            keyButton(")", tip: "插入右括号") { vm.insert(")") }
+            Button {
+                vm.backspace()
+            } label: {
+                Image(systemName: "delete.left")
+                    .font(.body.weight(.semibold))
+                    .frame(maxWidth: .infinity, minHeight: 30)
+            }
+            .buttonStyle(KeyCapStyle())
+            .help("退格：删除光标前一个字符")
+            .pointerStyle(.link)
+        }
+    }
+
+    private func keyButton(_ label: String, tip: String,
+                           action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(label)
+                .font(.body.monospaced().weight(.semibold))
+                .frame(maxWidth: .infinity, minHeight: 30)
+        }
+        .buttonStyle(KeyCapStyle())
+        .help(tip)
+        .pointerStyle(.link)
+    }
+
+    // MARK: 参考列表
+
     private func referenceSection(_ title: String,
-                                  items: [(proto: String, desc: String)]) -> some View {
+                                  items: [ReferenceItem]) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(title).font(.subheadline.bold()).foregroundStyle(.secondary)
             ForEach(items, id: \.proto) { item in
-                HStack(alignment: .firstTextBaseline, spacing: 10) {
-                    Text(item.proto)
-                        .font(.callout.monospaced())
-                        .foregroundStyle(.blue)
-                        .frame(width: 110, alignment: .leading)
-                    Text("—")
-                        .foregroundStyle(.quaternary)
-                    Text(item.desc)
-                        .font(.callout)
+                ReferenceRow(item: item) {
+                    vm.insert(item.insert, caretOffset: item.caretOffset,
+                              selectLength: item.selectLength)
                 }
             }
         }
     }
 
-    private let operators: [(String, String)] = [
-        ("a + b",        "加法"),
-        ("a - b",        "减法"),
-        ("a * b",        "乘法"),
-        ("a / b",        "除法（除零报错）"),
-        ("a ^ b",        "幂运算，右结合：2^3^2 = 2^(3²) = 512"),
-        ("( ... )",      "括号，提升优先级"),
-        ("-a",           "一元负号，优先级低于 ^：-3^2 = -9")
+    // MARK: 参考数据（insert 为点击后插入的文本；caretOffset/selectLength 定位占位符）
+
+    private let operators: [ReferenceItem] = [
+        ReferenceItem("a + b",   "加法", insert: "+"),
+        ReferenceItem("a - b",   "减法", insert: "-"),
+        ReferenceItem("a * b",   "乘法", insert: "*"),
+        ReferenceItem("a / b",   "除法（除零报错）", insert: "/"),
+        ReferenceItem("a ^ b",   "幂运算，右结合：2^3^2 = 2^(3²) = 512", insert: "^"),
+        ReferenceItem("( ... )", "括号，提升优先级", insert: "()", caretOffset: 1),
+        ReferenceItem("-a",      "一元负号，优先级低于 ^：-3^2 = -9", insert: "-")
     ]
 
-    private let constants: [(String, String)] = [
-        ("pi",  "圆周率 π ≈ 3.14159"),
-        ("e",   "自然常数 e ≈ 2.71828")
+    private let constants: [ReferenceItem] = [
+        ReferenceItem("pi", "圆周率 π ≈ 3.14159"),
+        ReferenceItem("e",  "自然常数 e ≈ 2.71828")
     ]
 
-    private let trig: [(String, String)] = [
-        ("sin(x)",   "正弦（参数单位：弧度）"),
-        ("cos(x)",   "余弦（参数单位：弧度）"),
-        ("tan(x)",   "正切（参数单位：弧度）"),
-        ("deg(r)",   "弧度 → 角度，r × 180 / π"),
-        ("rad(d)",   "角度 → 弧度，d × π / 180")
+    private let trig: [ReferenceItem] = [
+        ReferenceItem("sin(x)", "正弦（参数单位：弧度）", caretOffset: 4, selectLength: 1),
+        ReferenceItem("cos(x)", "余弦（参数单位：弧度）", caretOffset: 4, selectLength: 1),
+        ReferenceItem("tan(x)", "正切（参数单位：弧度）", caretOffset: 4, selectLength: 1),
+        ReferenceItem("deg(r)", "弧度 → 角度，r × 180 / π", caretOffset: 4, selectLength: 1),
+        ReferenceItem("rad(d)", "角度 → 弧度，d × π / 180", caretOffset: 4, selectLength: 1)
     ]
 
-    private let logarithm: [(String, String)] = [
-        ("ln(x)",      "自然对数（以 e 为底）"),
-        ("log(x)",     "常用对数（以 10 为底），log(100) = 2"),
-        ("log(b, x)",  "以 b 为底的对数，log(2, 8) = 3"),
-        ("exp(x)",     "e 的 x 次幂"),
-        ("pow(a, b)",  "a 的 b 次幂"),
-        ("sqrt(x)",    "平方根（x ≥ 0）")
+    private let logarithm: [ReferenceItem] = [
+        ReferenceItem("ln(x)",     "自然对数（以 e 为底）", caretOffset: 3, selectLength: 1),
+        ReferenceItem("log(x)",    "常用对数（以 10 为底），log(100) = 2", caretOffset: 4, selectLength: 1),
+        ReferenceItem("log(b, x)", "以 b 为底的对数，log(2, 8) = 3", caretOffset: 4, selectLength: 1),
+        ReferenceItem("exp(x)",    "e 的 x 次幂", caretOffset: 4, selectLength: 1),
+        ReferenceItem("pow(a, b)", "a 的 b 次幂", caretOffset: 4, selectLength: 1),
+        ReferenceItem("sqrt(x)",   "平方根（x ≥ 0）", caretOffset: 5, selectLength: 1)
     ]
 
-    private let numeric: [(String, String)] = [
-        ("abs(x)",   "绝对值"),
-        ("ceil(x)",  "向上取整"),
-        ("floor(x)", "向下取整"),
-        ("round(x)", "四舍五入（.5 向偶数）")
+    private let numeric: [ReferenceItem] = [
+        ReferenceItem("abs(x)",   "绝对值", caretOffset: 4, selectLength: 1),
+        ReferenceItem("ceil(x)",  "向上取整", caretOffset: 5, selectLength: 1),
+        ReferenceItem("floor(x)", "向下取整", caretOffset: 6, selectLength: 1),
+        ReferenceItem("round(x)", "四舍五入（.5 向偶数）", caretOffset: 6, selectLength: 1)
     ]
 
     private func format(_ value: Double) -> String {
@@ -622,6 +810,113 @@ struct ContentView: View {
     }
 }
 
+// MARK: - 参考项模型与可点击行
+
+private struct ReferenceItem {
+    let proto: String       // 界面展示
+    let insert: String      // 点击插入的文本
+    let caretOffset: Int?   // 插入后光标相对插入起点的偏移（nil = 插入文本末尾）
+    let selectLength: Int   // 光标处选中的占位符长度（0 = 纯光标）
+    let desc: String
+
+    init(_ proto: String, _ desc: String,
+         insert: String? = nil, caretOffset: Int? = nil, selectLength: Int = 0) {
+        self.proto = proto
+        self.desc = desc
+        self.insert = insert ?? proto
+        self.caretOffset = caretOffset
+        self.selectLength = selectLength
+    }
+}
+
+private struct ReferenceRow: View {
+    let item: ReferenceItem
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Text(item.proto)
+                    .font(.callout.monospaced())
+                    .foregroundStyle(.blue)
+                    .frame(width: 110, alignment: .leading)
+                Text("—")
+                    .foregroundStyle(.quaternary)
+                Text(item.desc)
+                    .font(.callout)
+                    .foregroundStyle(hovering ? .primary : .secondary)
+                Image(systemName: "plus.circle")
+                    .foregroundStyle(.blue)
+                    .imageScale(.small)
+                    .opacity(hovering ? 1 : 0)
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(hovering ? Color.blue.opacity(0.10) : Color.clear)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .pointerStyle(.link)
+        .onHover { hovering = $0 }
+        .help("点击插入 \(item.insert)")
+    }
+}
+
+// MARK: - 变量值标签（点击插入变量名）
+
+private struct VariableChip: View {
+    let name: String
+    let value: String
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Text("\(name) = \(value)")
+                .font(.caption.monospaced())
+                .padding(.horizontal, 7)
+                .padding(.vertical, 2)
+                .background(
+                    Capsule().fill(hovering ? Color.accentColor.opacity(0.15)
+                                            : Color.primary.opacity(0.04))
+                )
+                .overlay(
+                    Capsule().strokeBorder(hovering ? Color.accentColor.opacity(0.4) : Color.clear,
+                                           lineWidth: 1)
+                )
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .pointerStyle(.link)
+        .onHover { hovering = $0 }
+        .help("插入变量 \(name)")
+    }
+}
+
+// MARK: - 按键风格
+
+struct KeyCapStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(configuration.isPressed
+                          ? Color.accentColor.opacity(0.30)
+                          : Color.primary.opacity(0.06))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .strokeBorder(Color.primary.opacity(configuration.isPressed ? 0.15 : 0.08),
+                                  lineWidth: 1)
+            )
+            .scaleEffect(configuration.isPressed ? 0.95 : 1)
+            .animation(.easeOut(duration: 0.08), value: configuration.isPressed)
+    }
+}
 
 // MARK: - ════════════════════════════════════════════════════════════════════
 //  第三部分：App 入口
