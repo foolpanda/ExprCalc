@@ -1,0 +1,25 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: 构建 ExprCalc.app
+        run: ./build.sh app
+      - name: 打包 zip
+        run: ditto -c -k --sequesterRsrc --keepParent ExprCalc.app ExprCalc-macOS.zip
+      - name: 发布 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then TAG="$GITHUB_REF_NAME"; else TAG="v$(date +%Y.%m.%d)"; fi
+          gh release create "$TAG" ExprCalc-macOS.zip --title "ExprCalc $TAG" --generate-notes --clobber
